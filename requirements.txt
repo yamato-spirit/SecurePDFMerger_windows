@@ -1,0 +1,5 @@
+charset-normalizer==3.4.4
+numpy==1.21.6
+Pillow==9.5.0
+pygame==2.6.1
+reportlab==3.6.13
