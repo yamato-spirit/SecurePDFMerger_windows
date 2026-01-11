@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-lightgrey)
+![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
 
 ## 📖 概要 (Overview)
 **Secure PDF Merger** は、PDFファイルの結合・ページ編集・フォーマット変換を直感的なGUIで行えるデスクトップアプリケーションです。
