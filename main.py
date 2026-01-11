@@ -5,6 +5,19 @@ import copy
 from utils import pdf_ops
 from PIL import Image
 
+# --- 【修正1】PyInstaller用のパス解決関数を追加 ---
+def resource_path(relative_path):
+    """ PyInstallerでリソースの絶対パスを取得する """
+    try:
+        # PyInstallerで作成された一時フォルダのパス
+        base_path = sys._MEIPASS
+    except Exception:
+        # 通常実行時のパス
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+# ------------------------------------------------
+
 # --- UI設定 ---
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -391,6 +404,7 @@ class App(ctk.CTk):
             img_label = ctk.CTkLabel(frame, text="", image=img)
             img_label.place(relx=0.5, rely=0.5, anchor="center")
             img_label.bind("<Button-1>", lambda e, idx=index: self.start_drag(e, idx))
+            # 個別バインドは残すが、メインはGlobal Bindで制御
             img_label.bind("<B1-Motion>", self.on_drag)
             img_label.bind("<ButtonRelease-1>", self.stop_drag)
 
@@ -544,8 +558,12 @@ class App(ctk.CTk):
     def start_drag(self, event, index):
         self.dragging_index = index
         self.configure(cursor="fleur")
-        # ドラッグ開始時はスクロール領域の計算を行っておく(一回だけ)
+        # ドラッグ開始時はスクロール領域の計算を行っておく
         self.full_refresh_list_ui(update_scroll_region=True)
+        # ★重要修正: マウスがウィンドウ外に出てもドラッグを継続させるために
+        # アプリ全体(self)にイベントをバインドします
+        self.bind("<B1-Motion>", self.on_drag, add="+")
+        self.bind("<ButtonRelease-1>", self.stop_drag, add="+")
 
     def on_drag(self, event):
         if self.dragging_index is None: return
@@ -560,7 +578,7 @@ class App(ctk.CTk):
         
         target_index = -1
         
-        # ヒットテスト (軽量化のため全件チェックするが、処理は最小限に)
+        # ヒットテスト
         for i, child in enumerate(children):
             if not child.winfo_exists(): continue
             c_left = child.winfo_rootx()
@@ -568,10 +586,13 @@ class App(ctk.CTk):
             c_width = child.winfo_width()
             c_height = child.winfo_height()
             
+            # マウスがそのアイテムの上にあるか判定
             if (c_left < mouse_x < c_left + c_width) and (c_top < mouse_y < c_top + c_height):
                 target_index = i
                 break
         
+        # マウスが外にある場合、target_indexは-1のまま（＝並び替えを実行しない）
+        # これにより、UI外にカーソルが出てもエラーにならず、戻ってきたら再開できる
         if target_index != -1 and target_index != self.dragging_index:
             if self.view_mode == "page":
                 self.pages.insert(target_index, self.pages.pop(self.dragging_index))
@@ -586,7 +607,6 @@ class App(ctk.CTk):
                 self.pages = [p for g in groups for p in g]
             
             self.dragging_index = target_index
-            # ★ドラッグ中は update_scroll_region=False にしてカクつきを防止
             self.full_refresh_list_ui(update_scroll_region=False)
 
     def check_auto_scroll(self):
@@ -608,7 +628,6 @@ class App(ctk.CTk):
                 scroll_dir = 1
             
             if scroll_dir != 0:
-                # ★修正: self.auto_scroll_amount を使ってスクロール量を増やす
                 canvas.yview_scroll(int(scroll_dir * self.auto_scroll_amount), "units")
                 self.auto_scroll_job = self.after(self.auto_scroll_speed, self.do_auto_scroll_loop)
         except: pass
@@ -619,6 +638,10 @@ class App(ctk.CTk):
             self.check_auto_scroll()
 
     def stop_drag(self, event):
+        # ★重要修正: バインドを解除
+        self.unbind("<B1-Motion>")
+        self.unbind("<ButtonRelease-1>")
+
         if self.auto_scroll_job:
             self.after_cancel(self.auto_scroll_job)
             self.auto_scroll_job = None
@@ -626,7 +649,6 @@ class App(ctk.CTk):
         if self.dragging_index is not None: self.save_state()
         self.dragging_index = None
         self.configure(cursor="")
-        # ドロップ時はしっかり再描画する
         self.full_refresh_list_ui(update_scroll_region=True)
 
     def open_preview(self, start_page=0):
