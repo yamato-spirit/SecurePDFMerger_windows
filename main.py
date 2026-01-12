@@ -6,7 +6,7 @@ from utils import pdf_ops
 from PIL import Image
 import sys
 
-# --- 【修正1】PyInstaller用のパス解決関数を追加 ---
+# --- PyInstaller用のパス解決関数 ---
 def resource_path(relative_path):
     """ PyInstallerでリソースの絶対パスを取得する """
     try:
@@ -166,7 +166,7 @@ class App(ctk.CTk):
         self.base_thumb_size = 200     
         self.auto_scroll_speed = 20    # 自動スクロールのチェック間隔(ms)
         self.auto_scroll_margin = 50   # 反応領域(px)
-        self.auto_scroll_amount = 20   # ★自動スクロールの移動量 (数値を増やすと速くなる)
+        self.auto_scroll_amount = 20   # 自動スクロールの移動量
         # ------------
 
         self.title("Secure PDF Merger")
@@ -239,7 +239,15 @@ class App(ctk.CTk):
     def _on_mouse_wheel(self, event):
         try:
             canvas = self.scrollable_list._parent_canvas
+            # 現在の垂直位置（0.0が一番上）を取得
+            top_pos = canvas.yview()[0]
+            
             units = int(-1 * (event.delta / 120) * self.mouse_wheel_speed)
+            
+            # 一番上でさらに上にスクロールしようとした場合は無視
+            if top_pos <= 0.0 and units < 0:
+                return
+
             canvas.yview_scroll(units, "units")
         except: pass
 
@@ -289,6 +297,11 @@ class App(ctk.CTk):
             self.zoom_frame.grid_forget()
             
         self.full_refresh_list_ui()
+        
+        # モード切替時にスクロール位置を最上部にリセット
+        try:
+            self.scrollable_list._parent_canvas.yview_moveto(0)
+        except: pass
 
     def add_files_event(self):
         filetypes = [("All Files", "*.*")]
@@ -348,7 +361,6 @@ class App(ctk.CTk):
         if self.preview_window and self.preview_window.winfo_exists():
             self.preview_window.update_preview(self.pages)
 
-        # ★カクつき防止: ドラッグ中(update_scroll_region=False)は重い処理をスキップ
         if update_scroll_region:
             self.scrollable_list.update_idletasks()
             try:
@@ -405,7 +417,6 @@ class App(ctk.CTk):
             img_label = ctk.CTkLabel(frame, text="", image=img)
             img_label.place(relx=0.5, rely=0.5, anchor="center")
             img_label.bind("<Button-1>", lambda e, idx=index: self.start_drag(e, idx))
-            # 個別バインドは残すが、メインはGlobal Bindで制御
             img_label.bind("<B1-Motion>", self.on_drag)
             img_label.bind("<ButtonRelease-1>", self.stop_drag)
 
@@ -557,23 +568,17 @@ class App(ctk.CTk):
         self.full_refresh_list_ui()
 
     def start_drag(self, event, index):
-        # 【修正】ドラッグを開始する直前（並び順が変わる前）の状態を保存する
         self.save_state() 
         self.dragging_index = index
         self.configure(cursor="fleur")
-        # ドラッグ開始時はスクロール領域の計算を行っておく
         self.full_refresh_list_ui(update_scroll_region=True)
-        # ★重要修正: マウスがウィンドウ外に出てもドラッグを継続させるために
-        # アプリ全体(self)にイベントをバインドします
         self.bind("<B1-Motion>", self.on_drag, add="+")
         self.bind("<ButtonRelease-1>", self.stop_drag, add="+")
 
     def on_drag(self, event):
         if self.dragging_index is None: return
         
-        # --- 自動スクロール判定 ---
         self.check_auto_scroll()
-        # -----------------------
 
         mouse_y = self.scrollable_list._parent_canvas.winfo_pointery()
         mouse_x = self.scrollable_list._parent_canvas.winfo_pointerx()
@@ -581,7 +586,6 @@ class App(ctk.CTk):
         
         target_index = -1
         
-        # ヒットテスト
         for i, child in enumerate(children):
             if not child.winfo_exists(): continue
             c_left = child.winfo_rootx()
@@ -589,13 +593,10 @@ class App(ctk.CTk):
             c_width = child.winfo_width()
             c_height = child.winfo_height()
             
-            # マウスがそのアイテムの上にあるか判定
             if (c_left < mouse_x < c_left + c_width) and (c_top < mouse_y < c_top + c_height):
                 target_index = i
                 break
         
-        # マウスが外にある場合、target_indexは-1のまま（＝並び替えを実行しない）
-        # これにより、UI外にカーソルが出てもエラーにならず、戻ってきたら再開できる
         if target_index != -1 and target_index != self.dragging_index:
             if self.view_mode == "page":
                 self.pages.insert(target_index, self.pages.pop(self.dragging_index))
@@ -617,7 +618,6 @@ class App(ctk.CTk):
 
         try:
             canvas = self.scrollable_list._parent_canvas
-            # キャンバスのスクリーン上の座標
             c_top = canvas.winfo_rooty()
             c_height = canvas.winfo_height()
             c_bottom = c_top + c_height
@@ -630,6 +630,13 @@ class App(ctk.CTk):
             elif mouse_y > c_bottom - self.auto_scroll_margin:
                 scroll_dir = 1
             
+            # --- 【修正】ドラッグ時も一番上にいるときは上スクロールを禁止 ---
+            if scroll_dir == -1:
+                # 現在位置が一番上(0.0)以下ならスクロールさせない
+                if canvas.yview()[0] <= 0.0:
+                    scroll_dir = 0
+            # --------------------------------------------------------
+
             if scroll_dir != 0:
                 canvas.yview_scroll(int(scroll_dir * self.auto_scroll_amount), "units")
                 self.auto_scroll_job = self.after(self.auto_scroll_speed, self.do_auto_scroll_loop)
@@ -641,18 +648,12 @@ class App(ctk.CTk):
             self.check_auto_scroll()
 
     def stop_drag(self, event):
-        # ★重要修正: バインドを解除
         self.unbind("<B1-Motion>")
         self.unbind("<ButtonRelease-1>")
 
         if self.auto_scroll_job:
             self.after_cancel(self.auto_scroll_job)
             self.auto_scroll_job = None
-
-        # 【修正】以前はここで save_state を呼んでいましたが、
-        # そうすると「並び替えた後の状態」が履歴に残ってしまい、
-        # Undoしたときに「並び替える前の状態」に戻れなかったため削除しました。
-        # 代わりに start_drag で保存しています。
         
         self.dragging_index = None
         self.configure(cursor="")
