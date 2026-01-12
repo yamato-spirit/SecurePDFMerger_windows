@@ -4,6 +4,7 @@ import os
 import copy
 from utils import pdf_ops
 from PIL import Image
+import sys
 
 # --- 【修正1】PyInstaller用のパス解決関数を追加 ---
 def resource_path(relative_path):
@@ -556,6 +557,8 @@ class App(ctk.CTk):
         self.full_refresh_list_ui()
 
     def start_drag(self, event, index):
+        # 【修正】ドラッグを開始する直前（並び順が変わる前）の状態を保存する
+        self.save_state() 
         self.dragging_index = index
         self.configure(cursor="fleur")
         # ドラッグ開始時はスクロール領域の計算を行っておく
@@ -646,7 +649,11 @@ class App(ctk.CTk):
             self.after_cancel(self.auto_scroll_job)
             self.auto_scroll_job = None
 
-        if self.dragging_index is not None: self.save_state()
+        # 【修正】以前はここで save_state を呼んでいましたが、
+        # そうすると「並び替えた後の状態」が履歴に残ってしまい、
+        # Undoしたときに「並び替える前の状態」に戻れなかったため削除しました。
+        # 代わりに start_drag で保存しています。
+        
         self.dragging_index = None
         self.configure(cursor="")
         self.full_refresh_list_ui(update_scroll_region=True)
