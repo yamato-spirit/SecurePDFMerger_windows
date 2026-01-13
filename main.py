@@ -5,6 +5,7 @@ import copy
 from utils import pdf_ops
 from PIL import Image
 import sys
+import threading  # 非同期処理用に追加
 
 # --- PyInstaller用のパス解決関数 ---
 def resource_path(relative_path):
@@ -23,6 +24,37 @@ def resource_path(relative_path):
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
+# --- 処理中オーバーレイ（ローディング画面）クラス ---
+class ProcessingOverlay(ctk.CTkToplevel):
+    def __init__(self, parent, message="処理中..."):
+        super().__init__(parent)
+        self.title("")
+        self.geometry("300x120")
+        self.resizable(False, False)
+        self.attributes("-topmost", True) # 常に最前面
+        
+        # 親ウィンドウの中央に配置
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        x = parent_x + (parent_w // 2) - 150
+        y = parent_y + (parent_h // 2) - 60
+        self.geometry(f"+{x}+{y}")
+
+        # モーダル化（親ウィンドウの操作をブロック）
+        self.transient(parent)
+        self.grab_set()
+
+        self.label = ctk.CTkLabel(self, text=message, font=("Arial", 16))
+        self.label.pack(pady=20)
+        
+        self.progress = ctk.CTkProgressBar(self, width=200, mode="indeterminate")
+        self.progress.pack(pady=10)
+        self.progress.start()
+
+# ------------------------------------------------
+
 class PreviewWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -33,6 +65,7 @@ class PreviewWindow(ctk.CTkToplevel):
         self.current_page = 0
         self.total_pages = 0
         self.pdf_stream = None
+        self.is_loading = False # 連打防止用
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Left>", lambda e: self.prev_page())
@@ -100,34 +133,60 @@ class PreviewWindow(ctk.CTkToplevel):
         self.parent.toggle_orientation(self.current_page, False, item)
 
     def update_preview(self, page_list, start_page=None):
+        """プレビュー生成を非同期化"""
         if not page_list:
             self.image_label.configure(text="ファイルがありません", image=None)
             self.page_label.configure(text="0 / 0")
             return
         
+        if self.is_loading: return
+        self.is_loading = True
+        self.image_label.configure(text="Generating Preview...", image=None)
+
         if start_page is not None:
             self.current_page = start_page
 
-        self.pdf_stream = pdf_ops.merge_pdfs_securely(page_list, output_path=None)
+        # スレッド起動
+        thread = threading.Thread(target=self._update_preview_thread, args=(page_list,))
+        thread.daemon = True
+        thread.start()
+
+    def _update_preview_thread(self, page_list):
+        """バックグラウンドで結合＆画像生成"""
+        # メモリ上で結合
+        stream = pdf_ops.merge_pdfs_securely(page_list, output_path=None)
         
-        if self.pdf_stream:
+        total = 0
+        if stream:
             import fitz
             try:
-                with fitz.open(stream=self.pdf_stream, filetype="pdf") as doc:
-                    self.total_pages = len(doc)
+                with fitz.open(stream=stream, filetype="pdf") as doc:
+                    total = len(doc)
             except:
-                self.total_pages = 0
+                total = 0
+        
+        # メインスレッドでUI更新
+        self.after(0, self._update_preview_callback, stream, total)
+
+    def _update_preview_callback(self, stream, total_pages):
+        self.pdf_stream = stream
+        self.total_pages = total_pages
+        
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
             
-            if self.current_page >= self.total_pages:
-                self.current_page = max(0, self.total_pages - 1)
-            self.show_page()
+        self.is_loading = False
+        self.show_page()
 
     def show_page(self):
         if not self.pdf_stream or self.total_pages == 0:
             self.image_label.configure(text="No Pages", image=None)
             return
 
+        # ページ描画も重い場合があるが、PyMuPDFは高速なのでここは同期処理のままでOK
+        # (必要ならここも非同期化可能だが、チラつきの原因になるため現状維持)
         pil_image = pdf_ops.get_preview_image(self.pdf_stream, self.current_page)
+        
         if pil_image:
             w, h = pil_image.size
             if w > h:
@@ -164,9 +223,9 @@ class App(ctk.CTk):
         # --- 設定値 ---
         self.mouse_wheel_speed = 200.0   
         self.base_thumb_size = 200     
-        self.auto_scroll_speed = 20    # 自動スクロールのチェック間隔(ms)
-        self.auto_scroll_margin = 50   # 反応領域(px)
-        self.auto_scroll_amount = 20   # 自動スクロールの移動量
+        self.auto_scroll_speed = 20    
+        self.auto_scroll_margin = 50   
+        self.auto_scroll_amount = 20   
         # ------------
 
         self.title("Secure PDF Merger")
@@ -184,6 +243,7 @@ class App(ctk.CTk):
         self.auto_scroll_job = None 
         
         self.thumbnail_cache = {}
+        self.loading_overlay = None # ローディング画面用変数
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -236,18 +296,24 @@ class App(ctk.CTk):
         
         self.last_width = 0
 
+    # --- ヘルパー: ローディング表示 ---
+    def show_loading(self, message="処理中..."):
+        if self.loading_overlay is None or not self.loading_overlay.winfo_exists():
+            self.loading_overlay = ProcessingOverlay(self, message)
+        self.update()
+
+    def hide_loading(self):
+        if self.loading_overlay and self.loading_overlay.winfo_exists():
+            self.loading_overlay.destroy()
+            self.loading_overlay = None
+
     def _on_mouse_wheel(self, event):
         try:
             canvas = self.scrollable_list._parent_canvas
-            # 現在の垂直位置（0.0が一番上）を取得
             top_pos = canvas.yview()[0]
-            
             units = int(-1 * (event.delta / 120) * self.mouse_wheel_speed)
-            
-            # 一番上でさらに上にスクロールしようとした場合は無視
             if top_pos <= 0.0 and units < 0:
                 return
-
             canvas.yview_scroll(units, "units")
         except: pass
 
@@ -297,52 +363,73 @@ class App(ctk.CTk):
             self.zoom_frame.grid_forget()
             
         self.full_refresh_list_ui()
-        
-        # モード切替時にスクロール位置を最上部にリセット
         try:
             self.scrollable_list._parent_canvas.yview_moveto(0)
         except: pass
 
+    # --- 非同期: ファイル追加 ---
     def add_files_event(self):
         filetypes = [("All Files", "*.*")]
         file_paths = filedialog.askopenfilenames(title="ファイルを選択", filetypes=filetypes)
         
         if file_paths:
             self.save_state()
-            for path in file_paths:
-                final_path = path
-                filename = os.path.basename(path)
-                
-                if not path.lower().endswith('.pdf'):
-                    print(f"Converting: {filename}")
-                    try:
-                        converted = pdf_ops.convert_to_pdf(path, is_landscape=False)
-                        if converted and os.path.exists(converted):
-                            final_path = converted
-                        else:
-                            print(f"Skipping: {filename}")
-                            continue
-                    except: continue
+            self.show_loading("ファイルを読み込んでいます...")
+            
+            # スレッド開始
+            thread = threading.Thread(target=self._process_files_thread, args=(file_paths,))
+            thread.daemon = True
+            thread.start()
 
-                info = pdf_ops.get_pdf_info(final_path)
-                if info:
-                    for i in range(info['pages']):
-                        is_port = True
-                        if 'page_details' in info and i < len(info['page_details']):
-                            is_port = info['page_details'][i]['is_portrait']
+    def _process_files_thread(self, file_paths):
+        """バックグラウンドで変換と解析を行う"""
+        new_pages = []
+        for path in file_paths:
+            final_path = path
+            filename = os.path.basename(path)
+            is_generated = False
+            
+            # PDF以外の変換 (重い処理)
+            if not path.lower().endswith('.pdf'):
+                print(f"Converting: {filename}")
+                try:
+                    converted = pdf_ops.convert_to_pdf(path, is_landscape=False)
+                    if converted and os.path.exists(converted):
+                        final_path = converted
+                        is_generated = True
+                    else:
+                        print(f"Skipping: {filename}")
+                        continue
+                except: continue
 
-                        self.pages.append({
-                            'path': final_path,
-                            'original_source_path': path,
-                            'is_generated': (final_path != path),
-                            'filename': filename,
-                            'page_index': i,
-                            'rotation': 0,
-                            'is_portrait_original': is_port,
-                            'is_landscape_generated': False,
-                            'id': f"{filename}_{i}_{os.urandom(4).hex()}"
-                        })
-            self.full_refresh_list_ui()
+            # PDF情報取得 (やや重い処理)
+            info = pdf_ops.get_pdf_info(final_path)
+            if info:
+                for i in range(info['pages']):
+                    is_port = True
+                    if 'page_details' in info and i < len(info['page_details']):
+                        is_port = info['page_details'][i]['is_portrait']
+
+                    new_pages.append({
+                        'path': final_path,
+                        'original_source_path': path,
+                        'is_generated': is_generated,
+                        'filename': filename,
+                        'page_index': i,
+                        'rotation': 0,
+                        'is_portrait_original': is_port,
+                        'is_landscape_generated': False,
+                        'id': f"{filename}_{i}_{os.urandom(4).hex()}"
+                    })
+        
+        # 完了したらメインスレッドに戻す
+        self.after(0, self._add_files_finished, new_pages)
+
+    def _add_files_finished(self, new_pages):
+        """メインスレッドでリスト更新"""
+        self.pages.extend(new_pages)
+        self.full_refresh_list_ui()
+        self.hide_loading()
 
     # --- UI更新 (軽量化対応) ---
     def full_refresh_list_ui(self, update_scroll_region=True):
@@ -420,28 +507,23 @@ class App(ctk.CTk):
             img_label.bind("<B1-Motion>", self.on_drag)
             img_label.bind("<ButtonRelease-1>", self.stop_drag)
 
-        # --- ボタン類の追加 (左上) ---
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent", width=90, height=30)
         btn_frame.place(relx=0.03, rely=0.03, anchor="nw")
 
-        # 1. 削除ボタン (✕)
         del_btn = ctk.CTkButton(btn_frame, text="✕", width=24, height=24, fg_color="#cc0000", hover_color="#990000",
                                 font=("Arial", 14, "bold"),
                                 command=lambda: self.delete_item(index, False, item_data))
         del_btn.pack(side="left", padx=1)
 
-        # 2. 回転ボタン (↻)
         rot_btn = ctk.CTkButton(btn_frame, text="↻", width=24, height=24, fg_color="#0099cc", hover_color="#006699",
                                 font=("Arial", 14, "bold"),
                                 command=lambda: self.rotate_item(index, False, item_data))
         rot_btn.pack(side="left", padx=1)
 
-        # 3. 拡大プレビューボタン (🔍)
         zoom_btn = ctk.CTkButton(btn_frame, text="🔍", width=24, height=24, fg_color="#ff9900", hover_color="#cc7a00",
                                 font=("Arial", 14, "bold"),
                                 command=lambda: self.open_preview(start_page=index))
         zoom_btn.pack(side="left", padx=1)
-        # -----------------------------
 
         num_label = ctk.CTkLabel(frame, text=str(index+1), width=20, height=20, fg_color="gray", text_color="white", corner_radius=10)
         num_label.place(relx=0.95, rely=0.05, anchor="ne")
@@ -514,7 +596,7 @@ class App(ctk.CTk):
                       text_color="white", font=("Arial", 20), hover_color=("gray70", "gray30"),
                       command=lambda: self.toggle_orientation(index, True, item_data)).pack(side="right", padx=2)
 
-    # --- 共通操作 ---
+    # --- 共通操作 (非同期化: 縦横変換) ---
     def toggle_orientation(self, index, is_group, item_data):
         self.save_state()
         if not is_group:
@@ -528,21 +610,37 @@ class App(ctk.CTk):
         source = target_item.get('original_source_path')
         is_land = target_item.get('is_landscape_generated', False)
         
+        # Office変換など再生成が必要な場合のみ非同期処理へ
         if is_gen and source and os.path.exists(source):
-            new_is_landscape = not is_land
-            print(f"Re-converting to {'Landscape' if new_is_landscape else 'Portrait'}...")
-            try:
-                new_pdf_path = pdf_ops.convert_to_pdf(source, is_landscape=new_is_landscape)
-                if new_pdf_path:
-                    for item in target_list:
-                        item['path'] = new_pdf_path
-                        item['is_landscape_generated'] = new_is_landscape
-                        item['rotation'] = 0
-                    self.full_refresh_list_ui()
-                    return
-            except: pass
-        
-        self.rotate_item(index, is_group, item_data)
+            self.show_loading("縦横を変換して再生成中...")
+            thread = threading.Thread(
+                target=self._toggle_orientation_thread,
+                args=(index, is_group, target_list, source, is_land)
+            )
+            thread.daemon = True
+            thread.start()
+        else:
+            # ただの回転なら同期処理で十分（即終わるため）
+            self.rotate_item(index, is_group, item_data)
+
+    def _toggle_orientation_thread(self, index, is_group, target_list, source, is_land):
+        new_is_landscape = not is_land
+        try:
+            new_pdf_path = pdf_ops.convert_to_pdf(source, is_landscape=new_is_landscape)
+            # UI更新スレッドへ
+            self.after(0, self._toggle_orientation_finished, target_list, new_pdf_path, new_is_landscape)
+        except Exception as e:
+            print(f"Orientation error: {e}")
+            self.after(0, self.hide_loading)
+
+    def _toggle_orientation_finished(self, target_list, new_pdf_path, new_is_landscape):
+        if new_pdf_path:
+            for item in target_list:
+                item['path'] = new_pdf_path
+                item['is_landscape_generated'] = new_is_landscape
+                item['rotation'] = 0
+            self.full_refresh_list_ui()
+        self.hide_loading()
 
     def delete_item(self, index, is_group, item_data):
         self.save_state()
@@ -630,12 +728,9 @@ class App(ctk.CTk):
             elif mouse_y > c_bottom - self.auto_scroll_margin:
                 scroll_dir = 1
             
-            # --- 【修正】ドラッグ時も一番上にいるときは上スクロールを禁止 ---
             if scroll_dir == -1:
-                # 現在位置が一番上(0.0)以下ならスクロールさせない
                 if canvas.yview()[0] <= 0.0:
                     scroll_dir = 0
-            # --------------------------------------------------------
 
             if scroll_dir != 0:
                 canvas.yview_scroll(int(scroll_dir * self.auto_scroll_amount), "units")
@@ -670,15 +765,25 @@ class App(ctk.CTk):
         if self.preview_window and self.preview_window.winfo_exists():
             self.preview_window.update_preview(self.pages)
 
+    # --- 非同期: PDF結合と保存 ---
     def merge_event(self):
         if not self.pages: return
         output_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Files", "*.pdf")])
         if output_path:
-            self.configure(cursor="watch"); self.update()
-            success = pdf_ops.merge_pdfs_securely(self.pages, output_path)
-            self.configure(cursor="")
-            if success: messagebox.showinfo("成功", "完了しました")
-            else: messagebox.showerror("エラー", "失敗しました")
+            self.show_loading("PDFを結合して保存中...")
+            
+            thread = threading.Thread(target=self._merge_thread, args=(self.pages, output_path))
+            thread.daemon = True
+            thread.start()
+
+    def _merge_thread(self, pages, output_path):
+        success = pdf_ops.merge_pdfs_securely(pages, output_path)
+        self.after(0, self._merge_finished, success)
+
+    def _merge_finished(self, success):
+        self.hide_loading()
+        if success: messagebox.showinfo("成功", "完了しました")
+        else: messagebox.showerror("エラー", "失敗しました")
 
 if __name__ == "__main__":
     app = App()
